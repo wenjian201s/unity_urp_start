@@ -1,0 +1,11 @@
+fileFormatVersion: 2
+guid: 3a5c3bb467535384daf14ceb7574fe0c
+ShaderImporter:
+  externalObjects: {}
+  defaultTextures:
+  - _WarpTex: {instanceID: 0}
+  - _CubeMap: {instanceID: 0}
+  nonModifiableTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
