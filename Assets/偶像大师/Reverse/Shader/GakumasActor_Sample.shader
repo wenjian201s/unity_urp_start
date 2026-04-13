@@ -70,6 +70,7 @@ Shader "Unlit/GakumasActor_Sample"
 			{
 				"RenderType"="Opaque"
 				 "RenderPipeLine"="UniversalRenderPipeline" //用于指明使用URP来渲染
+				 
 			}
 			LOD 100
 
