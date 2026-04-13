@@ -29,7 +29,7 @@ Material:
         m_Offset: {x: 0, y: 0}
     m_Ints: []
     m_Floats:
-    - _AlphaClipThreshold: 0.43500173
+    - _AlphaClipThreshold: 0.8
     - _GridAlphaIntensity: 2
     - _GridPixelSize: 3.5
     m_Colors: []
