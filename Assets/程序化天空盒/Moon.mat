@@ -1,0 +1,93 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!21 &2100000
+Material:
+  serializedVersion: 8
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_Name: Moon
+  m_Shader: {fileID: 4800000, guid: a163ece625d50fd4690f2e45aa041be0, type: 3}
+  m_Parent: {fileID: 0}
+  m_ModifiedSerializedProperties: 0
+  m_ValidKeywords: []
+  m_InvalidKeywords: []
+  m_LightmapFlags: 4
+  m_EnableInstancingVariants: 0
+  m_DoubleSidedGI: 0
+  m_CustomRenderQueue: -1
+  stringTagMap: {}
+  disabledShaderPasses: []
+  m_LockedProperties: 
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs:
+    - StarColorLut:
+        m_Texture: {fileID: 2800000, guid: 4a64618e785b3cc48812c69424501710, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _IrradianceMap:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _MainTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _MoonTex:
+        m_Texture: {fileID: 2800000, guid: b03b77d7517d1914bb252fa464dd9421, type: 3}
+        m_Scale: {x: 0.25, y: 0.25}
+        m_Offset: {x: 0, y: 0.5}
+    - _NoiseMap:
+        m_Texture: {fileID: 2800000, guid: f0c1371545bdfd9459aa2e5e0102013e, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _StarDotMap:
+        m_Texture: {fileID: 2800000, guid: 359e3d6385f26854fa1ff3b5589a287a, type: 3}
+        m_Scale: {x: 1, y: 1.2}
+        m_Offset: {x: 0, y: 0}
+    - _galaxyTex:
+        m_Texture: {fileID: 2800000, guid: b7b6a33b2e259f24f9d61c105e09dd3f, type: 3}
+        m_Scale: {x: 0.45, y: 0.61}
+        m_Offset: {x: 0.55, y: 0.6}
+    m_Ints: []
+    m_Floats:
+    - _IrradianceMapG_maxAngleRange: 0.2
+    - _IrradianceMapR_maxAngleRange: 0.47
+    - _Metallic: 0
+    - _MoonMaskRadius: 5.49
+    - _MoonRadius: 2.15
+    - _Moon_color_intensity: 1.39
+    - _NoiseSpeed: 0.079
+    - _Smoothness: 0.5
+    - _SunAdditionIntensity: 1.65
+    - _SunInnerBoundary: 0
+    - _SunOuterBoundary: 1.48
+    - _SunRadius: 8.3
+    - _SunScattering: 1
+    - _SunSize: 1
+    - _galaxy_INT: 0.2
+    - _galaxy_intensity: 0.6893891
+    - _mainColorMoonGatherFactor: 0.74
+    - _mainColorSunGatherFactor: 0.27
+    - _starColorIntensity: 12.4402
+    - _starIntensityLinearDamping: 0.557
+    - _sun_color_intensity: 0.9
+    - _sun_disk_power_999: 465.62
+    m_Colors:
+    - _MainColor: {r: 1, g: 1, b: 1, a: 1}
+    - _MoonColor: {r: 1, g: 1, b: 1, a: 1}
+    - _MoonDirection: {r: 0.18936181, g: -0.005181967, b: 0.9818937, a: 0}
+    - _MoonScatteringColor: {r: 0.13333334, g: 0.3647059, b: 0.5568628, a: 1}
+    - _Moon_color: {r: 0.5372549, g: 0.5372549, b: 0.5372549, a: 1}
+    - _StarColorLut_ST: {r: 0.5, g: 1, b: 0, a: 0}
+    - _SunAdditionColor: {r: 0.79607844, g: 0.7921569, b: 0.8156863, a: 1}
+    - _SunDirection: {r: 0.5230827, g: -0.7926781, b: -0.31312278, a: 0}
+    - _downPartSkyColor: {r: 0.16078432, g: 0.3647059, b: 0.5882353, a: 1}
+    - _downPartSunColor: {r: 0.19607843, g: 0.35686275, b: 0.5764706, a: 1}
+    - _sun_color: {r: 0.25490198, g: 0.23921569, b: 0.23137255, a: 1}
+    - _sun_color_Scat: {r: 0.28235295, g: 0.28235295, b: 0.28235295, a: 1}
+    - _upPartSkyColor: {r: 0.05490196, g: 0.21960784, b: 0.3764706, a: 1}
+    - _upPartSunColor: {r: 0.07058824, g: 0.23137255, b: 0.39607844, a: 1}
+  m_BuildTextureStacks: []

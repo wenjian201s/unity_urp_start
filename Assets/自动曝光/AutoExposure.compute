@@ -1,0 +1,177 @@
+// 【作用】引入URP（通用渲染管线）的核心着色器库
+// 【原理】该库包含了许多内置的宏、函数和变量（例如下面用到的 _ScreenSize），是编写URP着色器的基础。
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+
+// 【作用】定义计算着色器X轴的线程数量为16
+// 【原理】计算着色器以“线程组”为单位执行，16x16=256个线程是一个常见且效率较高的线程组配置。
+#define NUMTHREAD_X 16
+// 【作用】定义计算着色器Y轴的线程数量为16
+#define NUMTHREAD_Y 16
+
+// 【作用】定义一个可读写的参数结构体（RW代表Read/Write）
+// 【原理】用于在CPU和GPU之间，或者GPU的不同线程/Pass之间共享和传递自动曝光的核心数据。
+struct RWParameters
+{
+    uint importance;   // 【作用】记录屏幕像素的“重要性”权重总和。【原理】用于计算加权平均亮度，通常中心像素权重高，边缘权重低。
+    uint luminance;    // 【作用】记录屏幕像素的“加权亮度”总和。【原理】亮度乘以重要性权重后累加的值。
+    float historyEV;   // 【作用】记录上一帧的历史曝光值（EV100）。【原理】用于与当前帧的曝光值进行平滑插值，防止画面曝光突变。
+    float exposure;    // 【作用】存储最终计算出的曝光乘数。【原理】这是一个0~1（或更大/更小）的系数，直接乘以屏幕颜色来调节明暗。
+};
+
+// 【作用】定义一个只读的参数结构体（R代表Read）
+// 【原理】用于从CPU端接收一些不需要被GPU修改的运行时数据。
+struct RParameters
+{
+    float deltaTime;   // 【作用】存储当前帧的帧间隔时间（秒）。【原理】用于计算基于时间的平滑过渡，确保不同帧率下曝光变化速度一致。
+};
+
+// 【作用】定义一个静态常量三维向量，表示RGB到亮度的转换系数
+// 【原理】基于人眼对不同颜色敏感度的BT.709标准（人眼对绿色最敏感，红色次之，蓝色最弱）。将RGB乘以该向量并相加即可得到感知亮度。
+static const float3 _RGB2Luminance = float3(0.2126, 0.7152, 0.0722);
+
+// 【作用】声明一个可读写的屏幕纹理
+// 【原理】UAV（无序访问视图）纹理，允许计算着色器中的任意线程同时读取和修改纹理上的像素数据。
+RWTexture2D<float4> _ScreenTexture;
+// 【作用】声明一个可读写的结构体缓冲区，对应上面的RWParameters
+// 【原理】允许计算着色器中的多个线程使用原子操作（如InterlockedAdd）安全地对同一个内存地址进行数据累加。
+RWStructuredBuffer<RWParameters> _RWParameters;
+// 【作用】声明一个只读的结构体缓冲区，对应上面的RParameters
+// 【原理】仅用于从CPU读取数据到GPU，效率比RW缓冲区更高，且防止GPU端意外修改。
+StructuredBuffer<RParameters> _RParameters;
+
+// 【作用】告诉Unity编译器下面是一个名为 "AccumulateLuminance" 的计算着色器内核
+// 【原理】在C#端通过 CommandBuffer.DispatchCompute 调用时，需要指定这个名字来找到对应的入口函数。
+#pragma kernel AccumulateLuminance
+// 【作用】指定该Kernel的线程组大小为 16x16x1
+// 【原理】决定了GPU调度硬件如何分配线程，总共256个线程在一个组内同步执行。
+[numthreads(NUMTHREAD_X, NUMTHREAD_Y, 1)]
+// 【作用】定义计算着色器的入口函数
+// 【原理】id代表当前线程在全局的三维索引（对应屏幕像素坐标），groupIndex代表当前线程在其所属线程组内的索引。
+void AccumulateLuminance(uint3 id : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
+{
+    // 【作用】判断当前线程是否是屏幕左上角的第一个线程 (0,0)
+    // 【原理】!any(id.xy) 当且仅当x和y都为0时返回true。利用单一线程来进行全局变量的初始化，避免多线程同时清零导致的竞争或多余开销。
+    if (!any(id.xy))
+    {
+        // 【作用】将重要性权重清零
+        _RWParameters[0].importance = 0;
+        // 【作用】将亮度总和清零
+        _RWParameters[0].luminance = 0;
+        // 【作用】将曝光值清零（此处清零无实际影响，因为会在下一个Kernel中重新计算，但属于好习惯）
+        _RWParameters[0].exposure = 0;
+    }
+    
+    // 【作用】将当前像素的整数坐标转换为 [0,1] 范围的归一化UV坐标
+    // 【原理】除以屏幕尺寸得到纹理坐标，用于计算该像素在屏幕上的相对位置。使用half节省带宽和寄存器。
+    half2 uv = id.xy / _ScreenSize.xy;
+    // 【作用】定义屏幕中心的UV坐标
+    // 【原理】自动曝光通常认为画面中心的物体更重要（视觉焦点），(0.5, 0.5) 即是正中心。
+    half2 uvCenter = half2(0.5, 0.5);
+    // 【作用】计算当前像素的“重要性”权重
+    // 【原理】distance计算当前像素到中心的距离（0~0.707），乘2放大到(0~1.414)，用1减去并saturate截断到(0~1)（此时边缘为0，中心为1）。最后pow(x,2)进行二次方衰减，让中心的权重更集中，边缘衰减更剧烈。
+    float importance = pow(saturate(1.0 - (distance(uv, uvCenter) * 2.0)), 2);
+
+    // 【作用】从屏幕纹理中读取当前像素的RGB颜色
+    // 【原理】直接通过id.xy索引读取，避免了传统片元着色器中的采样插值。
+    float3 screenColor = _ScreenTexture[id.xy].rgb;
+    // 【作用】计算该像素的感知亮度
+    // 【原理】将RGB颜色向量与_Luminance系数进行点乘，得到一个灰度亮度值。
+    float luminance = dot(screenColor, _RGB2Luminance);
+    
+    // 【作用】将浮点数的重要性权重放大100倍并转为无符号整数
+    // 【原理】因为GPU不支持直接对浮点数进行原子加法（或者性能较差），所以将其量化为整数。
+    uint imp = (uint) (100.0 * importance);
+    // 【作用】将浮点数的“加权亮度”放大100倍并转为无符号整数
+    // 【原理】luminance * importance 计算出加权亮度，乘100量化为整数，准备进行累加。
+    uint lum = (uint) (100.0 * luminance * importance);
+    
+    // 【作用】将当前线程计算出的整数权重原子累加到全局缓冲区中
+    // 【原理】InterlockedAdd 是GPU硬件级别的原子操作，保证即使成千上万个线程同时执行这行代码，数据也不会丢失或覆盖。
+    InterlockedAdd(_RWParameters[0].importance, imp);
+    // 【作用】将当前线程计算出的整数加权亮度原子累加到全局缓冲区中
+    // 【原理】同上，安全地汇总全屏幕的亮度信息。
+    InterlockedAdd(_RWParameters[0].luminance, lum);
+}
+
+// 【作用】根据物理亮度计算摄影学中的曝光值（EV100）
+// 【原理】公式基于ISO 100、光圈f/1.0、快门1秒的标定。EV = log2(L * K)，其中K通常取12.5（这里用8，可能是针对特定游戏引擎或色调映射的调整）。max防止亮度为0时log2报错。
+float GetEV100(float luminance)
+{
+    // 【作用】限制亮度下限
+    // 【原理】1e-5是一个极小的正数，防止传入0导致 log2(0) 产生负无穷或NaN错误。
+    luminance = max(luminance, 1e-5);
+    // 【作用】计算并返回EV100
+    // 【原理】对数关系符合人眼对光的非线性感知特性。
+    return log2(luminance * 8.0);
+}
+
+// 【作用】根据当前平均亮度计算经过时间平滑的目标EV
+// 【原理】防止画面在明暗交替场景瞬间闪烁，实现平滑的“人眼适应黑暗/强光”效果。
+float GetTargetEV(float luminance)
+{
+    // 【作用】计算当前帧画面应有的理论EV
+    // 【原理】调用上面的物理公式转换。
+    float avgEV = GetEV100(luminance);
+    // 【作用】先将目标EV设为当前EV
+    // 【原理】作为后续逻辑的初始值。
+    float targetEV = avgEV;
+    // 【作用】从缓冲区读取上一帧的EV
+    // 【原理】作为平滑插值的起点。
+    float historyEV = _RWParameters[0].historyEV;
+    // 【作用】计算当前EV与历史EV的差值
+    // 【原理】差值代表画面明暗变化的幅度，正数表示变亮，负数表示变暗。
+    float diff = avgEV - historyEV;
+    // 【作用】获取帧时间，但限制最大不超过0.033秒（约30帧）
+    // 【原理】限制最大步长。如果游戏发生卡顿（deltaTime很大），避免下一帧曝光发生巨大的跳跃式突变。
+    float t = min(_RParameters[0].deltaTime, 0.033);
+    
+    // 【作用】计算并返回平滑后的EV
+    // 【原理】这是一个简化的线性插值（LERP）公式：起点 + (终点 - 起点) * 权重。这里t作为插值系数，实现了与帧率无关的匀速逼近。注意：人眼适应暗处更慢，这里暂未区分明暗适应速度差异（简化版）。
+    return historyEV + diff * t;
+}
+
+// 【作用】声明第二个计算着色器Kernel
+// 【原理】因为该Kernel只需要做一次简单的除法和赋值，所以独立出来，在第一个Kernel全屏幕统计完成后再执行。
+#pragma kernel ComputeTargetEV
+// 【作用】指定该Kernel的线程组大小为 1x1x1
+// 【原理】只需要执行一次的计算任务，只开启1个线程，避免浪费GPU资源。
+[numthreads(1, 1, 1)]
+// 【作用】定义第二个入口函数
+void ComputeTargetEV(uint3 id : SV_DispatchThreadID)
+{
+    // 【作用】将整数的亮度总和反量化为浮点数
+    // 【原理】除以100，还原回之前累加时放大的倍数，得到真实的全屏加权亮度总和。
+    float lum = 0.01 * _RWParameters[0].luminance;
+    // 【作用】将整数的重要性总和反量化为浮点数，并限制下限
+    // 【原理】除以100还原。使用max(..., 1e-5)是为了绝对防止分母为0，避免除零错误导致画面全白/全黑。
+    float imp = max(0.01 * _RWParameters[0].importance, 1e-5);
+    // 【作用】计算全屏的加权平均亮度
+    // 【原理】总加权亮度 / 总权重 = 平均亮度。这比直接算术平均更合理，因为它排除了黑色边框或暗角的干扰。
+    float avgLuminance = lum / imp;
+    // 【作用】获取经过时间平滑处理的目标EV
+    // 【原理】调用上面的平滑函数，得到一个不会突变的EV值。
+    float targetEV = GetTargetEV(avgLuminance);
+    // 【作用】将当前的目标EV保存为历史EV，供下一帧使用
+    // 【原理】更新状态机的记忆。
+    _RWParameters[0].historyEV = targetEV;
+    // 【作用】将EV值转换为最终的颜色曝光乘数
+    // 【原理】摄影学原理：曝光量与EV是2的指数关系。1 / 2^EV 就是将画面提亮或压暗的系数。例如EV=-1，系数就是2（提亮一档）；EV=1，系数就是0.5（压暗一档）。
+    _RWParameters[0].exposure = 1.0 / pow(2.0, targetEV);
+}
+
+// 【作用】声明第三个计算着色器Kernel
+// 【原理】前两个Kernel只做了计算，这个Kernel负责将计算好的结果真正应用到画面像素上。
+#pragma kernel ApplyExposure
+// 【作用】指定该Kernel的线程组大小为 16x16x1
+// 【原理】由于需要逐像素处理全屏图像，重新使用256个线程的配置以充分利用GPU并行计算能力。
+[numthreads(NUMTHREAD_X, NUMTHREAD_Y, 1)]
+// 【作用】定义第三个入口函数
+void ApplyExposure(uint3 id : SV_DispatchThreadID)
+{
+    // 【作用】读取当前像素的原始颜色
+    // 【原理】获取未曝光调整前的RGB值。
+    float3 screenColor = _ScreenTexture[id.xy].rgb;
+    // 【作用】将原始颜色乘以曝光系数，并强制Alpha通道为1，然后写回屏幕纹理
+    // 【原理】screenColor * exposure 实现画面明暗调节。强制写入rgba而不是rgb，确保不会因为通道缺失导致后续渲染出错，Alpha设为1表示完全不透明。
+    _ScreenTexture[id.xy].rgba = float4(screenColor * _RWParameters[0].exposure, 1.0);
+}

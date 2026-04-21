@@ -1,0 +1,297 @@
+﻿// 【作用】引入URP核心着色器库
+// 【原理】提供屏幕尺寸、坐标转换等底层支持。
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+
+// 【作用】定义计算着色器X方向的线程组大小
+// 【原理】16x16=256个线程，是GPU调度的最优块大小之一。
+#define NUMTHREAD_X 16
+// 【作用】定义计算着色器Y方向的线程组大小
+#define NUMTHREAD_Y 16
+
+// 【作用】声明一个Shader变体宏，用于控制是否开启“局部曝光”
+// 【原理】multi_compile_local 允许在C#端通过关键词开关来生成两个版本的Shader。没有关键词时用全局曝光，有LOCAL_EXPOSURE时加入局部曝光计算。
+#pragma multi_compile_local __ LOCAL_EXPOSURE
+
+// 【作用】定义读写参数结构体
+// 【原理】存储自动曝光的核心状态数据，在GPU各Pass间共享。
+struct RWParameters
+{
+    uint importance;   // 【作用】屏幕空间权重总和（中心高，边缘低）
+    uint luminance;    // 【作用】加权亮度总和
+    float historyEV;   // 【作用】上一帧的全局平滑EV值
+    float exposure;    // 【作用】最终计算出的全局曝光乘数
+};
+
+
+// 【作用】定义只读参数结构体
+// 【原理】接收CPU端传递的配置参数。
+struct RParameters
+{
+    float deltaTime;       // 【作用】帧间隔时间。【原理】用于帧率无关的平滑插值。
+    float blurredLumBlend; // 【作用】模糊亮度混合系数。【原理】用于在“保留边缘的模糊”和“完全平滑的模糊”之间进行过渡控制。
+};
+
+// 【作用】定义RGB转感知亮度的标准系数
+// 【原理】基于BT.709色彩空间，人眼对绿色(0.7152)最敏感。
+static const float3 _RGB2Luminance = float3(0.2126, 0.7152, 0.0722);
+
+// 【作用】声明原始屏幕纹理（可读写）
+// 【原理】存储当前帧未处理的画面，最后也会把处理后的画面写回这里。
+RWTexture2D<float4> _ScreenTexture;
+// 【作用】声明读写缓冲区
+// 【原理】用于存储全局EV等统计参数。
+RWStructuredBuffer<RWParameters> _RWParameters;
+// 【作用】声明只读缓冲区
+StructuredBuffer<RParameters> _RParameters;
+
+
+//对于AutoExposure 新增内容
+
+//【作用】声明对数亮度图纹理（可读写）
+// 【原理】将屏幕每个像素的亮度转换为对数空间存储，因为人眼对光的感知接近对数关系，在对数空间做后续模糊处理更符合视觉规律。
+RWTexture2D<float> _LogLuminance;
+// 【作用】声明双边滤波后的对数亮度图（可读写）
+// 【原理】双边滤波的特点是“平滑区域但保留边缘”，这张图用于计算局部曝光，防止逆光边缘出现光晕。
+RWTexture2D<float> _BilateralLogLuminance;
+// 【作用】声明高斯模糊后的对数亮度图（可读写）
+// 【原理】纯粹的平滑模糊亮度图，完全不考虑边缘。
+RWTexture2D<float> _GaussianLogLuminance;
+// 【作用】声明高斯模糊的临时缓冲区（可读写）
+// 【原理】高斯模糊采用“两步分离法”（先横向后纵向），需要一个中间纹理来保存横向模糊的结果。
+RWTexture2D<float> _GaussianTempBuffer;
+
+
+
+#pragma kernel AccumulateLuminance
+[numthreads(NUMTHREAD_X, NUMTHREAD_Y, 1)] //16x16x1 的计算核心
+// 【作用】Kernel 1：统计亮度并生成对数亮度图
+void AccumulateLuminance(uint3 id : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex) //id代表当前线程在全局的三维索引（对应屏幕像素坐标），groupIndex代表当前线程在其所属线程组内的索引。
+{
+    // 【作用】仅让左上角第一个线程执行初始化
+    // 【原理】避免多线程竞争，清空上一帧的统计值。
+    if (!any(id.xy))
+    {
+        _RWParameters[0].importance = 0;
+        _RWParameters[0].luminance = 0;
+        _RWParameters[0].exposure = 0;
+    }
+    
+    // 【作用】计算当前像素的UV和屏幕中心距离权重
+    // 【原理】与之前相同，认为画面中心更重要，边缘权重低。
+    half2 uv = id.xy / _ScreenSize.xy;
+    half2 uvCenter = half2(0.5, 0.5);
+    float importance = pow(saturate(1.0 - (distance(uv, uvCenter) * 2.0)), 2);
+
+    // 【作用】获取当前像素颜色并计算线性亮度
+    float3 screenColor = _ScreenTexture[id.xy].rgb;
+    float luminance = dot(screenColor, _RGB2Luminance);
+    
+    // 【作用】量化为整数并进行原子累加
+    // 【原理】为后续计算全局平均亮度做准备。
+    uint imp = (uint) (100.0 * importance);
+    uint lum = (uint) (100.0 * luminance * importance);
+    
+    InterlockedAdd(_RWParameters[0].importance, imp);
+    InterlockedAdd(_RWParameters[0].luminance, lum);
+    
+    // 【作用】将亮度写入对数亮度图
+    // 【原理】新增逻辑。使用log2将线性亮度转为对数亮度，max防止亮度为0时出现负无穷。这是后续局部曝光计算的源头数据。
+    _LogLuminance[id.xy] = log2(max(luminance, 1e-5));
+}//跟autoExporsure里的原理差不多
+
+
+
+// 【作用】物理亮度转EV100公式
+float GetEV100(float luminance)
+{
+    luminance = max(luminance, 1e-5);
+    return log2(luminance * 8.0);
+}
+
+
+// 【作用】基于时间的EV平滑过渡计算
+float GetTargetEV(float luminance) //与跟autoExporsure里的原理差不多
+{
+    float avgEV = GetEV100(luminance);
+    float targetEV = avgEV;
+    float historyEV = _RWParameters[0].historyEV;
+    float diff = avgEV - historyEV;
+    // 【作用】限制最大步长为30帧对应的时间
+    // 【原理】防止卡顿后曝光突变。
+    float t = min(_RParameters[0].deltaTime, 0.033);
+    
+    return historyEV + diff * t;
+}
+
+
+
+#pragma kernel ComputeTargetEV
+[numthreads(1, 1, 1)]
+// 【作用】Kernel 2：计算全局目标EV和全局曝光系数
+void ComputeTargetEV(uint3 id : SV_DispatchThreadID) //跟autoExporsure里的原理差不多
+{
+    // 【作用】还原并计算全屏加权平均亮度
+    float lum = 0.01 * _RWParameters[0].luminance;
+    float imp = max(0.01 * _RWParameters[0].importance, 1e-5);
+    float avgLuminance = lum / imp;
+    // 【作用】计算带时间平滑的全局EV
+    float targetEV = GetTargetEV(avgLuminance);
+    // 【作用】更新历史EV，供下一帧使用
+    _RWParameters[0].historyEV = targetEV;
+    // 【作用】将EV转换为全局曝光乘数
+    // 【原理】1 / 2^EV，用于后续统一调整画面基础明暗。
+    _RWParameters[0].exposure = 1.0 / pow(2.0, targetEV);
+}
+
+// 【作用】留作未来优化的占位符
+// 【原理】当前双边滤波复杂度为O(N^2)，未来可改为基于网格的O(N)算法提升性能。
+// TODO: Bilateral Grid O(n)
+#pragma kernel BilateralBlur
+[numthreads(NUMTHREAD_X, NUMTHREAD_Y, 1)]
+// 【作用】Kernel 3：对对数亮度图进行双边滤波
+void BilateralBlur(uint3 id : SV_DispatchThreadID)
+{
+    // 【作用】获取当前像素中心的对数亮度
+    // 【原理】作为后续计算“亮度相似度（范围权重）”的基准。
+    float centerLuminance = _LogLuminance[id.xy];  //获取当前像素位置的log 曝光权重
+    
+    // 【作用】定义滤波参数
+    // 【原理】radius=3表示采样7x7区域；sigmaSpatial控制空间距离衰减（越远权重越小）；sigmaRange控制亮度差异衰减（亮度差越大权重越小，以此保护边缘）。
+    int radius = 3;
+    float sigmaSpatial = 2.0;
+    float sigmaRange = 0.3;
+
+    float luminanceSum = 0.0; // 亮度的加权总和
+    float weightSum = 0.0; // 权重总和
+
+    // 【作用】遍历周围的像素
+    for (int y = -radius; y <= radius; y++)
+    {
+        for (int x = -radius; x <= radius; x++)
+        {
+            // 【作用】计算采样坐标并进行边界限制
+            // 【原理】防止采样超出屏幕边缘导致读取乱码。
+            int2 sampleCoord = int2(
+                clamp(id.x + x, 0, (int) _ScreenSize.x - 1),
+                clamp(id.y + y, 0, (int) _ScreenSize.y - 1)
+            );
+            // 【作用】读取邻域像素的对数亮度
+            float sampleLuminance = _LogLuminance[sampleCoord];
+        
+            // 【作用】计算空间高斯权重
+            // 【原理】基于像素间距离的高斯函数，距离中心越远，权重越低。
+            float weightSpatial = exp(-((x * x + y * y) / (2 * sigmaSpatial * sigmaSpatial)));
+            // 【作用】计算范围（亮度）高斯权重
+            // 【原理】基于亮度差值的高斯函数。如果邻域像素亮度和中心像素相差很大（比如处于黑白交界边缘），权重趋近于0，从而不污染中心像素的亮度。
+            float weightRange = exp(-((sampleLuminance - centerLuminance) * (sampleLuminance - centerLuminance) / (2 * sigmaRange * sigmaRange)));
+            // 【作用】计算综合权重
+            // 【原理】空间权重 × 范围权重 = 双边权重。
+            float weight = weightSpatial * weightRange;
+        
+            // 【作用】累加加权亮度
+            luminanceSum += sampleLuminance * weight;
+            // 【作用】累加权重总和
+            weightSum += weight;
+        }
+    }
+    // 【作用】输出滤波后的结果
+    // 【原理】加权平均值。结果是一张平滑了平坦区域，但保留了物体轮廓边缘的亮度图。
+    _BilateralLogLuminance[id.xy] = luminanceSum / max(weightSum, 1e-5);
+}
+
+#pragma kernel GaussianBlur  //高斯模糊
+[numthreads(NUMTHREAD_X, NUMTHREAD_Y, 1)]
+// 【作用】Kernel 4：对对数亮度图进行纯高斯模糊（分离计算）
+void GaussianBlur(uint3 id : SV_DispatchThreadID)
+{
+    // 【作用】定义高斯模糊参数
+    int radius = 3;
+    float sigma = 2.0;
+
+    // --- 第一遍：水平方向模糊 ---
+    float luminanceSumH = 0.0;
+    float weightSumH = 0.0;
+    // 【作用】沿X轴遍历邻域
+    for (int offsetX = -radius; offsetX <= radius; offsetX++) //对当前像素进行行的水平模糊
+    {
+        int sampleX = clamp(id.x + offsetX, 0, (int) _ScreenSize.x - 1);//钳制像素偏移范围
+        // 【作用】从原始对数亮度图读取水平方向的像素
+        float sampleLuminance = _LogLuminance[int2(sampleX, id.y)];
+        // 【作用】计算一维高斯权重
+        float weight = exp(-(offsetX * offsetX) / (2.0 * sigma * sigma));
+
+        luminanceSumH += sampleLuminance * weight;
+        weightSumH += weight;
+    }
+
+    // 【作用】计算水平模糊结果并写入临时缓冲区
+    // 【原理】分离模糊的第一步必须存入中间图，不能直接覆盖原图。
+    float horizontalBlur = luminanceSumH / max(weightSumH, 1e-5);
+    _GaussianTempBuffer[id.xy] = horizontalBlur; //存储当前水平模糊的结果
+
+
+    // --- 第二遍：垂直方向模糊 ---
+    float luminanceSumV = 0.0;
+    float weightSumV = 0.0;
+
+    // 【作用】沿Y轴遍历邻域
+    for (int offsetY = -radius; offsetY <= radius; offsetY++)
+    {
+        int sampleY = clamp(id.y + offsetY, 0, (int) _ScreenSize.y - 1);
+        // 【作用】从临时缓冲区（已水平模糊的图）读取垂直方向的像素
+        float sampleLuminance = _GaussianTempBuffer[int2(id.x, sampleY)];
+        // 【作用】计算一维高斯权重
+        float weight = exp(-(offsetY * offsetY) / (2.0 * sigma * sigma));
+
+        luminanceSumV += sampleLuminance * weight;
+        weightSumV += weight;
+    }
+
+    // 【作用】计算垂直模糊结果并输出最终的高斯模糊图
+    // 【原理】水平模糊+垂直模糊 = 等同于二维高斯模糊，但计算量从 O(N^2) 降到了 O(2N)，极大地提升了性能。这张图完全忽略了边缘，非常平滑。
+    _GaussianLogLuminance[id.xy] = luminanceSumV / max(weightSumV, 1e-5);
+}
+
+#pragma kernel ApplyExposure
+[numthreads(NUMTHREAD_X, NUMTHREAD_Y, 1)]
+// 【作用】Kernel 5：应用全局与局部曝光
+void ApplyExposure(uint3 id : SV_DispatchThreadID)
+{
+    // 【作用】读取原始颜色
+    float3 color = _ScreenTexture[id.xy].rgb;
+    // 【作用】获取前面计算好的全局曝光乘数
+    float globalExposure = _RWParameters[0].exposure;
+    // 【作用】初始化局部曝光乘数为1（即不改变）
+    float localExposure = 1;
+
+
+    // 【作用】检查是否开启了局部曝光变体
+    #ifdef LOCAL_EXPOSURE
+    // 【作用】将双边滤波的对数亮度还原为线性亮度
+    // 【原理】exp2是log2的逆运算。这张图代表了“保留了边缘细节的周围环境亮度”。
+    float bilateralLuminance = exp2(_BilateralLogLuminance[id.xy]);
+    // 【作用】将纯高斯模糊的对数亮度还原为线性亮度
+    // 【原理】这张图代表了“绝对平滑的周围环境亮度”。
+    float blurredLuminance = exp2(_GaussianLogLuminance[id.xy]);
+    // 【作用】混合两种亮度
+    // 【原理】通过C#端传入的blurredLumBlend参数，可以让美术在“强调边缘保护（bilateral）”和“完全平滑（blurred）”之间自由调节。
+    float localLuminance = lerp(bilateralLuminance, blurredLuminance, _RParameters[0].blurredLumBlend);
+
+    // 【作用】计算当前像素所在局部区域的EV值
+    float localEV = GetEV100(localLuminance);
+    // 【作用】计算局部EV与全局历史EV的差值
+    // 【原理】如果局部比全局暗，diffEV为负；局部比全局亮，diffEV为正。
+    float diffEV = localEV - _RWParameters[0].historyEV;
+    
+    // 【作用】计算局部曝光乘数
+    // 【原理】pow(2, -diffEV)可以将局部亮度拉平到全局水平。乘以0.5是一种“削弱”手段，防止局部曝光把对比度完全抹平（即保留一定的明暗对比，只是稍微提亮暗部或压暗亮部）。
+    localExposure = pow(2.0, -diffEV * 0.5);
+    #endif
+
+    // 【作用】计算最终颜色
+    // 【原理】原始颜色 × 全局曝光（整体提亮/压暗） × 局部曝光（局部提亮/压暗，防止逆光死黑）。
+    float3 finalColor = color * globalExposure * localExposure;
+    
+    // 【作用】将结果写回屏幕
+    _ScreenTexture[id.xy] = float4(finalColor, 1.0);
+}
