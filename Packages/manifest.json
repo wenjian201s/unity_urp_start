@@ -1,5 +1,7 @@
 {
   "dependencies": {
+    "com.besty.unity-skills": "file:I:/BaiduNetdiskDownload/ai工具/Unity-Skills-1.6.1/SkillsForUnity",
+    "com.unity.cinemachine": "2.10.5",
     "com.unity.collab-proxy": "2.7.1",
     "com.unity.feature.development": "1.0.1",
     "com.unity.inputsystem": "1.14.2",
