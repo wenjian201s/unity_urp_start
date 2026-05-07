@@ -1,6 +1,4 @@
-﻿
-
-using UnityEngine;
+﻿using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 
@@ -65,7 +63,7 @@ public class ScreenSpaceReflectionPass_ssr : ScriptableRenderPass
     {
         m_DepthTexture = m_Renderer.cameraDepthTarget;
         m_ColorTexture = m_Renderer.cameraColorTarget;
-        m_NormalTexture = m_Renderer.cameraNormalTarget;
+        m_NormalTexture = m_Renderer.CameraResolveTarget;
         m_RenderTarget = m_Renderer.cameraColorTarget;
 
         cmd.GetTemporaryRT(Shader.PropertyToID("_OddBuffer"), renderingData.cameraData.cameraTargetDescriptor,
