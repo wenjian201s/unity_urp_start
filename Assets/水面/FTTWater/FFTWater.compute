@@ -1,0 +1,480 @@
+// FFTWater.compute
+// 说明：ComputeShader不属于Built-in或URP的光栅化渲染Pass，它直接在GPU计算队列中运行。
+// 因此从默认渲染管线迁移到URP时，ComputeShader主体通常不需要改写；
+// C#脚本负责把它生成的Texture2DArray传给URP水面Shader，URP Shader负责采样这些贴图完成最终渲染。
+
+// 初始化频谱内核 - 基于Tessendorf的海洋模拟方法
+#pragma kernel CS_InitializeSpectrum  // 标记Compute Shader入口：初始化海浪谱  
+#pragma kernel CS_PackSpectrumConjugate // 标记Compute Shader入口：打包谱的共轭值 打包共轭对称频谱内核 - 用于FFT的共轭对称性优化
+#pragma kernel CS_UpdateSpectrumForFFT // 标记Compute Shader入口：更新谱数据适配FFT 更新频谱用于FFT变换内核 - 应用时间演化
+#pragma kernel CS_HorizontalFFT // 标记Compute Shader入口：执行水平方向FFT 平方向FFT内核 - 计算水平方向的快速傅里叶变换
+#pragma kernel CS_VerticalFFT  // 标记Compute Shader入口：执行垂直方向FFT 垂直方向FFT内核 - 计算垂直方向的快速傅里叶变换
+#pragma kernel CS_AssembleMaps  // 标记Compute Shader入口：组装位移/斜率/泡沫贴图 组装贴图内核 - 将FFT结果转换为位移和法线贴图
+#pragma kernel CS_AccumulateFoam // 标记Compute Shader入口：泡沫累积（预留功能） 累积泡沫内核 - 计算泡沫效果
+
+#define PI 3.14159265358979323846  // 定义圆周率常量，用于三角函数/波相关计算
+
+Texture2D<float2> _PingTex; //输入的Ping贴图，用于迭代计算（通常为上一帧结果）
+// 可读写的频谱纹理数组：当前频谱、初始频谱、位移贴图
+// 1. _SpectrumTextures：存储时变频谱（位移/斜率分量）
+// 2. _InitialSpectrumTextures：存储初始频谱h₀(k)及共轭值
+// 3. _DisplacementTextures：存储最终位移（xyz）+ 泡沫值（a通道）
+// 使用Texture2DArray存储4个层级的海洋细节
+RWTexture2DArray<float4> _SpectrumTextures, _InitialSpectrumTextures, _DisplacementTextures;
+RWTexture2DArray<float2> _SlopeTextures; // 可读写的坡度纹理数组 - 存储法线信息 斜率数据
+RWTexture2D<half> _BuoyancyData; // 可读写的浮力数据贴图 - 用于浮力计算
+
+
+// 全局参数（由CPU端传入）：
+// 浮点变量：帧时间/时间增量/振幅系数/重力/重复周期/阻尼/水深/波数截止范围
+float _FrameTime, _DeltaTime, _A, _Gravity, _RepeatTime, _Damping, _Depth, _LowCutoff, _HighCutoff;
+int _Seed;   // 整型变量：随机种子（用于谱初始化的随机性）
+float2 _Wind, _Lambda, _NormalStrength; // 二维浮点变量：风向风速/缩放因子/法线强度
+uint _N, _LengthScale0, _LengthScale1, _LengthScale2, _LengthScale3;  // 无符号整型：FFT尺寸/4个长度尺度（对应不同波长）
+float _FoamBias, _FoamDecayRate, _FoamAdd, _FoamThreshold;// 浮点变量：泡沫偏置/衰减率/添加量/阈值
+
+// 复数乘法函数：输入a=(a_r,a_i), b=(b_r,b_i) 输入a=(实部a.x, 虚部a.y)，b=(实部b.x, 虚部b.y)
+// 公式：(a_r + i*a_i)(b_r + i*b_i) = (a_r*b_r - a_i*b_i) + i(a_r*b_i + a_i*b_r)
+float2 ComplexMult(float2 a, float2 b) { // 复数乘法函数：输入a=(a_r,a_i), b=(b_r,b_i)
+    return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+// 欧拉公式实现：e^(ix) = cos(x) + i*sin(x)
+// 用于波浪的时间演化相位计算
+float2 EulerFormula(float x) { 
+    return float2(cos(x), sin(x));
+}
+// 整数哈希函数（Hugo Elias算法）：将整数映射到[0,1)的伪随机浮点数
+// 用途：为Box-Muller变换生成均匀分布随机数
+float hash(uint n) {
+    // integer hash copied from Hugo Elias
+    n = (n << 13U) ^ n;// 位运算打乱：左移13位后异或自身
+    n = n * (n * n * 15731U + 0x789221U) + 0x1376312589U;// 乘法+加法进一步打乱数值
+    // 取低31位（避免负数），转换为[0,1)浮点数
+    return float(n & uint(0x7fffffffU)) / float(0x7fffffff);
+}
+// Box-Muller变换：将两个均匀分布随机数(u1,u2∈[0,1))转换为标准正态分布随机数 为高斯分布
+// 数学公式：
+// R = √(-2lnu1), θ=2πu2
+// Z₁ = Rcosθ, Z₂ = Rsinθ（两个独立的标准正态分布）
+// 用于生成符合高斯分布的初始波浪振幅
+// 文献链接：https://doi.org/10.1214/aoms/1177706645
+float2 UniformToGaussian(float u1, float u2) {
+    float R = sqrt(-2.0f * log(u1));// 极坐标半径
+    float theta = 2.0f * PI * u2; // 极坐标角度
+
+    return float2(R * cos(theta), R * sin(theta));// 返回二维高斯分布随机数
+}
+
+// 海浪谱参数结构体：存储JONSWAP能谱+方向谱的核心参数
+// FFT and JONSWAP Implementation largely referenced from https://github.com/gasgiant/FFT-Ocean/
+struct SpectrumParameters {
+	float scale;  // 谱整体缩放因子（控制海浪振幅）
+	float angle;// 主波方向角（与风向一致）
+	float spreadBlend;// 方向谱混合权重（DonelanBanner ↔ Cosine2s）
+	float swell;// 涌浪强度（增强长波方向的集中性）
+	float alpha; // JONSWAP谱的Phillips常数（控制谱的整体能量）
+	float peakOmega; // JONSWAP谱的峰频ωp（能量最高的频率）
+	float gamma;// JONSWAP谱的峰值增强因子（γ越大，谱峰越尖锐）
+	float shortWavesFade;// 短波衰减系数（抑制高频噪声）
+};
+// 结构化缓冲区：存储多组（8组，对应4个尺度×2层）海浪谱参数
+StructuredBuffer<SpectrumParameters> _Spectrums;
+
+// 色散关系函数：计算角频率ω（有限水深）
+// 数学公式：ω = √(g*k*tanh(kd)) 
+// g=重力加速度，k=波数模长，d=水深，tanh(kd)为双曲正切（浅水波修正）
+float Dispersion(float kMag) {
+    // 限制kd≤20避免tanh数值溢出（tanh(20)≈1，深水区近似）
+    return sqrt(_Gravity * kMag * tanh(min(kMag * _Depth, 20)));
+}
+// 色散关系对波数的导数：dω/dk（用于初始频谱幅值计算）
+// 数学推导：dω/dk = g/(2ω) * (kd/cosh²(kd) + tanh(kd))
+float DispersionDerivative(float kMag) {
+    float th = tanh(min(kMag * _Depth, 20));// tanh(kd)（限制kd≤20）
+    float ch = cosh(kMag * _Depth); // cosh(kd)（双曲余弦）
+    return _Gravity * (_Depth * kMag / ch / ch + th) / Dispersion(kMag) / 2.0f;
+}
+// 余弦2s次方方向谱的归一化因子（经验拟合公式）
+// 用途：保证方向谱在全角度积分结果为1（能量守恒）
+float NormalizationFactor(float s) {
+    float s2 = s * s; // s²
+    float s3 = s2 * s;// s³
+    float s4 = s3 * s;// s⁴
+    // 分段拟合：s<5时用低阶拟合，s≥5时用高阶拟合
+    if (s < 5) return -0.000564f * s4 + 0.00776f * s3 - 0.044f * s2 + 0.192f * s + 0.163f;
+    else return -4.80e-08f * s4 + 1.07e-05f * s3 - 9.53e-04f * s2 + 5.90e-02f * s + 3.93e-01f;
+}
+// DonelanBanner方向谱的β参数（分段函数）
+// 数学原理：DonelanBanner方向谱的核心参数，随ω/ωp变化
+// 文献链接：https://doi.org/10.1016/0304-3800(85)90082-1
+// 用于计算波陡相关参数，影响波浪破碎
+float DonelanBannerBeta(float x) {
+	if (x < 0.95f) return 2.61f * pow(abs(x), 1.3f); // x<0.95：β=2.61|x|^1.3
+	if (x < 1.6f) return 2.28f * pow(abs(x), -1.3f);// 0.95≤x<1.6：β=2.28|x|^-1.3
+    // x≥1.6：经验公式计算β
+	float p = -0.4f + 0.8393f * exp(-0.567f * log(x * x));
+	return pow(10.0f, p);
+}
+
+// DonelanBanner方向谱计算：描述海浪能量在不同方向的分布
+// 数学公式：D(θ) = β/(2tanh(βπ)) * sech²(βθ)，其中sech=1/cosh
+// 用于短波方向分布建模
+float DonelanBanner(float theta, float omega, float peakOmega) {
+	float beta = DonelanBannerBeta(omega / peakOmega); // 计算β（基于ω/ωp）
+	float sech = 1.0f / cosh(beta * theta);// 双曲正割
+	return beta / 2.0f / tanh(beta * 3.1416f) * sech * sech;// DonelanBanner方向谱值  // 归一化
+}
+// 余弦2s次方方向谱：另一种经典方向谱模型
+// 数学公式：D(θ) = N(s) * |cos(θ/2)|^(2s)，N(s)为归一化因子
+float Cosine2s(float theta, float s) {
+	return NormalizationFactor(s) * pow(abs(cos(0.5f * theta)), 2.0f * s);
+}
+// 方向谱的扩展幂次s（经验公式）：控制方向谱的集中程度
+// ω>ωp时s减小（能量分散），ω≤ωp时s增大（能量集中）
+float SpreadPower(float omega, float peakOmega) {
+	if (omega > peakOmega)
+		return 9.77f * pow(abs(omega / peakOmega), -2.5f);
+	else
+		return 6.97f * pow(abs(omega / peakOmega), 5.0f);
+}
+// 混合方向谱：线性插值DonelanBanner和Cosine2s模型
+// 数学公式：D(θ) = lerp(2/π cos²θ, Cosine2s(θ-θ₀,s), blend)
+float DirectionSpectrum(float theta, float omega, SpectrumParameters spectrum) {
+    // 计算扩展幂次s（含涌浪修正）
+	float s = SpreadPower(omega, spectrum.peakOmega) + 16 * tanh(min(omega / spectrum.peakOmega, 20)) * spectrum.swell * spectrum.swell;
+    // 线性混合两种方向谱
+	return lerp(2.0f / 3.1415f * cos(theta) * cos(theta), Cosine2s(theta - spectrum.angle, s), spectrum.spreadBlend);
+}
+// TMA修正：有限水深对JONSWAP谱的浅化修正（保证浅水波能量守恒）
+// 数学原理：TMA谱（Tromp-Maeda-Arsloe）修正因子，随无量纲频率ω√(d/g)变化
+// 文献链接：https://doi.org/10.1016/0304-3800(85)90059-5
+// 公式：C(ω) = { 0.5*(ω√(h/g))²          (ω√(h/g)≤1)
+//              { 1-0.5*(2-ω√(h/g))²    (1<ω√(h/g)<2)
+//              { 1                      (ω√(h/g)≥2)
+float TMACorrection(float omega) {
+	float omegaH = omega * sqrt(_Depth); // _Gravity);// 无量纲频率：ω√(d/g)
+	if (omegaH <= 1.0f)
+		return 0.5f * omegaH * omegaH ;// ω√(d/g)≤1：修正因子=0.5(ω√(d/g))²
+	if (omegaH < 2.0f)
+		return 1.0f - 0.5f * (2.0f - omegaH) * (2.0f - omegaH);// 1<ω√(d/g)<2：线性过渡
+
+	return 1.0f;// ω√(d/g)≥2：深水区，修正因子=1
+}
+// JONSWAP能谱计算：描述海浪能量在不同频率的分布
+// 数学公式（核心）：
+// S(ω) = αg²ω^-5 * exp(-1.25(ωp/ω)^4) * γ^exp(-(ω-ωp)²/(2σ²ωp²)) * TMA(ω)
+// 其中σ=0.07(ω≤ωp)，σ=0.09(ω>ωp)
+// 文献链接：https://doi.org/10.1016/0304-3800(76)90001-8
+float JONSWAP(float omega, SpectrumParameters spectrum) {
+    // 谱峰两侧的σ值（控制谱的形状）
+	float sigma = (omega <= spectrum.peakOmega) ? 0.07f : 0.09f;
+    // 指数项r：控制γ的衰减
+	float r = exp(-(omega - spectrum.peakOmega) * (omega - spectrum.peakOmega) / 2.0f / sigma / sigma / spectrum.peakOmega / spectrum.peakOmega);
+    // 简化计算：1/ω
+	float oneOverOmega = 1.0f / omega;
+    // 简化计算：ωp/ω
+	float peakOmegaOverOmega = spectrum.peakOmega / omega;
+    // 完整JONSWAP公式（含缩放、TMA修正）
+	return spectrum.scale * TMACorrection(omega) * spectrum.alpha * _Gravity * _Gravity
+		* oneOverOmega * oneOverOmega * oneOverOmega * oneOverOmega * oneOverOmega
+		* exp(-1.25f * peakOmegaOverOmega * peakOmegaOverOmega * peakOmegaOverOmega * peakOmegaOverOmega)
+		* pow(abs(spectrum.gamma), r);// γ^r（峰值增强）
+}
+// 短波衰减函数：抑制高频（短波）噪声，避免视觉闪烁
+// 数学公式：exp(-(k·shortWavesFade)²)
+float ShortWavesFade(float kLength, SpectrumParameters spectrum) {
+	return exp(-spectrum.shortWavesFade * spectrum.shortWavesFade * kLength * kLength);
+}
+// 初始化频谱内核：生成4个尺度的初始频谱h₀(k)
+// 线程组尺寸：8x8x1（每个线程处理一个频谱像素） 共64线程
+[numthreads(8,8,1)]
+void CS_InitializeSpectrum(uint3 id : SV_DISPATCHTHREADID) {
+
+    // 初始化随机种子（基于线程ID+FFT尺寸，保证每个像素种子唯一）
+    uint seed = id.x + _N * id.y + _N;
+    seed += _Seed; // 叠加用户定义的种子，控制全局随机性
+
+    // 4个长度尺度（对应4个海浪层级）
+    float lengthScales[4] = { _LengthScale0, _LengthScale1, _LengthScale2, _LengthScale3 };
+
+    for (uint i = 0; i < 4; ++i) { // 遍历4个长度尺度
+            float halfN = _N / 2.0f;// FFT尺寸的一半（波数坐标系中心）
+
+        // 波数间隔：Δk = 2π/L（L为当前尺度的长度）
+        float deltaK = 2.0f * PI / lengthScales[i];
+        // 波数向量：K=(kx,ky)，中心在(N/2,N/2)，范围[-π/L*N/2, π/L*N/2]
+        float2 K = (id.xy - halfN) * deltaK;
+        // 波数模长：|K| = √(kx²+ky²)
+        float kLength = length(K);
+
+        // 更新随机种子（引入哈希扰动，保证随机性）
+        seed += i + hash(seed) * 10;
+        // 生成4个均匀分布随机数（用于Box-Muller变换）
+        float4 uniformRandSamples = float4(hash(seed), hash(seed * 2), hash(seed * 3), hash(seed * 4));
+        // 转换为两组高斯分布随机数
+        float2 gauss1 = UniformToGaussian(uniformRandSamples.x, uniformRandSamples.y);
+        float2 gauss2 = UniformToGaussian(uniformRandSamples.z, uniformRandSamples.w);
+        // 仅处理有效波数范围（过滤过低/过高波数，减少计算量）
+        if (_LowCutoff <= kLength && kLength <= _HighCutoff) {
+            float kAngle = atan2(K.y, K.x); // 波数方向角：θ=atan2(ky,kx)（与x轴的夹角）
+            float omega = Dispersion(kLength);// 色散关系计算角频率ω
+
+            float dOmegadk = DispersionDerivative(kLength);// 计算dω/dk（色散导数）
+            // 计算总能谱：JONSWAP × 方向谱 × 短波衰减（第一组谱参数）
+            float spectrum = JONSWAP(omega, _Spectrums[i * 2]) * DirectionSpectrum(kAngle, omega, _Spectrums[i * 2]) * ShortWavesFade(kLength, _Spectrums[i * 2]);
+            // 叠加第二组谱参数（若存在）
+            if (_Spectrums[i * 2 + 1].scale > 0)
+                spectrum += JONSWAP(omega, _Spectrums[i * 2 + 1]) * DirectionSpectrum(kAngle, omega, _Spectrums[i * 2 + 1]) * ShortWavesFade(kLength, _Spectrums[i * 2 + 1]);
+            // 初始频谱h₀(k)计算：
+            // 数学公式：h₀(k) = (Z₁ + iZ₂) × √(2S(k) |dω/dk| Δk² / |k|)
+            // Z₁/Z₂为高斯随机数，保证频谱的正态分布特性
+            _InitialSpectrumTextures[uint3(id.xy, i)] = float4(float2(gauss2.x, gauss1.y) * sqrt(2 * spectrum * abs(dOmegadk) / kLength * deltaK * deltaK), 0.0f, 0.0f);
+        } else {
+            // 无效波数范围：频谱设为0
+            _InitialSpectrumTextures[uint3(id.xy, i)] = 0.0f;
+        }
+    }
+}
+
+// 打包共轭对称频谱内核：利用FFT实数信号的共轭对称性优化存储
+// 线程组尺寸：8x8x1
+[numthreads(8,8,1)]
+void CS_PackSpectrumConjugate(uint3 id : SV_DISPATCHTHREADID) {
+    for (uint i = 0; i < 4; ++i) { // 遍历4个长度尺度
+        // 读取当前波数k的初始频谱h₀(k)
+        float2 h0 = _InitialSpectrumTextures[uint3(id.xy, i)].rg;
+        // 读取波数-k的初始频谱h₀(-k)（共轭对称位置）
+        float2 h0conj = _InitialSpectrumTextures[uint3((_N - id.x ) % _N, (_N - id.y) % _N, i)].rg;
+        // 存储h₀(k)和h₀*(-k)（共轭值，虚部取反）
+        // 数学原理：实数信号的FFT满足H(-k) = H*(k)，仅需存储一半数据
+        _InitialSpectrumTextures[uint3(id.xy, i)] = float4(h0, h0conj.x, -h0conj.y);
+    }
+}
+
+// 更新频谱用于FFT内核：生成时变频谱h̃(k,t)，并计算位移/斜率谱分量
+// 线程组尺寸：8x8x1
+[numthreads(8, 8, 1)]
+void CS_UpdateSpectrumForFFT(uint3 id : SV_DISPATCHTHREADID) {
+    // 4个长度尺度数组
+    float lengthScales[4] = { _LengthScale0, _LengthScale1, _LengthScale2, _LengthScale3 };
+    // 遍历4个长度尺度
+    for (int i = 0; i < 4; ++i) {
+        // 读取初始频谱+共轭值
+        float4 initialSignal = _InitialSpectrumTextures[uint3(id.xy, i)];
+        float2 h0 = initialSignal.xy; // h₀(k)
+        float2 h0conj = initialSignal.zw;// h₀*(-k)
+
+        float halfN = _N / 2.0f;// FFT尺寸的一半
+        float2 K = (id.xy - halfN) * 2.0f * PI / lengthScales[i];// 波数向量K=(kx,ky)
+        float kMag = length(K);// 波数模长|K|
+        float kMagRcp = rcp(kMag);// |K|的快速倒数（GPU内置函数，比1/kMag快）
+
+        if (kMag < 0.0001f) { // 避免除零（波数接近0时，倒数设为1）
+            kMagRcp = 1.0f;
+        }
+
+        float w_0 = 2.0f * PI / _RepeatTime;// 基频：ω₀=2π/T（T为重复周期）
+        // 色散相位：floor(√(gk)/ω₀) × ω₀ × 帧时间（量化到基频倍数，保证周期性）
+        float dispersion = floor(sqrt(_Gravity * kMag) / w_0) * w_0 * _FrameTime;
+
+        float2 exponent = EulerFormula(dispersion);// 欧拉公式计算e^(i×色散相位)
+        
+        // 时变频谱h̃(k,t)计算：
+        // 数学公式：h̃(k,t) = h₀(k)e^(iωt) + h₀*(-k)e^(-iωt)
+        float2 htilde = ComplexMult(h0, exponent) + ComplexMult(h0conj, float2(exponent.x, -exponent.y));
+        // 计算i×h̃(k,t)（虚数乘法：i*(a+bi) = -b + ai）
+        float2 ih = float2(-htilde.y, htilde.x);
+
+        // 位移谱分量计算（线性波理论）：
+        float2 displacementX = ih * K.x * kMagRcp;// x方向位移谱
+        float2 displacementY = htilde;               // y方向（垂直）位移谱
+        float2 displacementZ = ih * K.y * kMagRcp; // z方向位移谱
+
+        // 斜率/二阶导数谱分量计算（法线/泡沫用）：
+        float2 displacementX_dx = -htilde * K.x * K.x * kMagRcp;// x位移的x偏导数
+        float2 displacementY_dx = ih * K.x;                     // y位移的x偏导数（斜率x）
+        float2 displacementZ_dx = -htilde * K.x * K.y * kMagRcp;// z位移的x偏导数
+
+        float2 displacementY_dz = ih * K.y;                     // y位移的z偏导数（斜率z）
+        float2 displacementZ_dz = -htilde * K.y * K.y * kMagRcp; // z位移的z偏导数
+
+        // 组合位移谱分量（修正虚部交叉项）
+        float2 htildeDisplacementX = float2(displacementX.x - displacementZ.y, displacementX.y + displacementZ.x);
+        float2 htildeDisplacementZ = float2(displacementY.x - displacementZ_dx.y, displacementY.y + displacementZ_dx.x);
+        // 组合斜率谱分量
+        float2 htildeSlopeX = float2(displacementY_dx.x - displacementY_dz.y, displacementY_dx.y + displacementY_dz.x);
+        float2 htildeSlopeZ = float2(displacementX_dx.x - displacementZ_dz.y, displacementX_dx.y + displacementZ_dz.x);
+        // 存储位移谱（i*2通道）和斜率谱（i*2+1通道）
+        _SpectrumTextures[uint3(id.xy, i * 2)] = float4(htildeDisplacementX, htildeDisplacementZ);
+        _SpectrumTextures[uint3(id.xy, i * 2 + 1)] = float4(htildeSlopeX, htildeSlopeZ);
+    }
+}
+// 复数指数函数：计算e^(a.x + i*a.y) = e^a.x * (cos(a.y) + i*sin(a.y))
+// 用途：FFT旋转因子计算
+float2 ComplexExp(float2 a) {
+    return float2(cos(a.y), sin(a.y) * exp(a.x));
+}
+// FFT临时缓冲区（Ping-Pong用，当前代码未实际使用）
+RWTexture2D<float4> _Buffer0, _Buffer1, _Buffer2, _Buffer3;
+uint _Step;
+// 计算FFT旋转因子和输入索引（当前代码未实际使用，预留扩展）
+float4 ComputeTwiddleFactorAndInputIndices(uint2 id) {
+    uint b = _N >> (id.x + 1);// 蝶形步长：b = N / 2^(id.x+1)
+    float2 mult = 2 * PI * float2(0.0f, 1.0f) / _N; // 2πi/N
+    uint i = (2 * b * (id.y / b) + id.y % b) % _N; // 计算输入索引i（蝶形运算的第一个输入）
+    float2 twiddle = ComplexExp(-mult * ((id.y / b) * b));// 计算旋转因子W_N^r = e^(-2πir/N)
+    // 返回旋转因子 + 两个输入索引
+    return float4(twiddle, i, i + b);
+}
+
+#define SIZE 1024// FFT尺寸（1024点，需为2的幂）
+#define LOG_SIZE 10// log2(SIZE) = 10（FFT迭代次数）
+
+RWTexture2DArray<float4> _FourierTarget;// FFT目标纹理（输入/输出频谱）
+bool _Direction;// FFT方向（当前代码未使用）
+// 分组共享内存：存储FFT蝶形运算的中间结果（GPU共享内存，加速访问）
+groupshared float4 fftGroupBuffer[2][SIZE];
+
+// 计算FFT蝶形运算的参数：索引+旋转因子
+// 数学原理：基2FFT蝶形运算，核心公式X_k = X_k + W_N^r X_{k+b}
+// 文献链接：https://en.wikipedia.org/wiki/Cooley%E2%80%93Tukey_FFT_algorithm
+void ButterflyValues(uint step, uint index, out uint2 indices, out float2 twiddle) {
+    const float twoPi = 6.28318530718; // 2π常量
+    uint b = SIZE >> (step + 1);       // 蝶形步长：b = SIZE / 2^(step+1)
+    uint w = b * (index / b);          // 旋转因子指数r
+    uint i = (w + index) % SIZE;       // 输入索引i
+    // 计算旋转因子cos/sin：cos(-2πw/SIZE)、sin(-2πw/SIZE)
+    sincos(-twoPi / SIZE * w, twiddle.y, twiddle.x);
+    //This is what makes it the inverse FFT
+    twiddle.y = -twiddle.y; // 虚部取反：将正FFT转为逆FFT（IDFT）
+    indices = uint2(i, i + b); // 蝶形运算的两个输入索引（i, i+b）
+}
+
+// 基2逆FFT蝶形运算（分组共享内存优化）
+// 输入：线程索引 + 频谱数据；输出：逆FFT后的空间域数据
+float4 FFT(uint threadIndex, float4 input) {
+    // 将输入写入共享内存（所有线程并行写入）
+    fftGroupBuffer[0][threadIndex] = input;
+    // 组内存屏障：确保所有线程完成写入后再继续
+    GroupMemoryBarrierWithGroupSync();
+    bool flag = false; // 缓冲区切换标志（双缓冲）
+
+    [unroll] // 循环展开（编译器优化，加速FFT）
+    for (uint step = 0; step < LOG_SIZE; ++step) {
+        uint2 inputsIndices; // 蝶形输入索引
+        float2 twiddle;      // 旋转因子
+        // 获取当前步骤的蝶形参数
+        ButterflyValues(step, threadIndex, inputsIndices, twiddle);
+
+        // 读取第二个输入值V = fftGroupBuffer[flag][i+b]
+        float4 v = fftGroupBuffer[flag][inputsIndices.y];
+        // 蝶形运算：X = A + W*V（A为第一个输入，W为旋转因子）
+        fftGroupBuffer[!flag][threadIndex] = fftGroupBuffer[flag][inputsIndices.x] + float4(ComplexMult(twiddle, v.xy), ComplexMult(twiddle, v.zw));
+
+        flag = !flag; // 切换缓冲区
+        GroupMemoryBarrierWithGroupSync(); // 组内存屏障
+    }
+
+    // 返回逆FFT结果
+    return fftGroupBuffer[flag][threadIndex];
+}
+
+// 水平方向FFT内核：对每行执行逆FFT
+// 线程组尺寸：SIZE×1×1（每个线程处理一行的一个元素）
+[numthreads(SIZE, 1, 1)]
+void CS_HorizontalFFT(uint3 id : SV_DISPATCHTHREADID) {
+    // 遍历8个谱通道（4个尺度×位移/斜率）
+    for (int i = 0; i < 8; ++i) {
+        // 对当前像素执行FFT，结果写回目标纹理
+        _FourierTarget[uint3(id.xy, i)] = FFT(id.x, _FourierTarget[uint3(id.xy, i)]);
+    }
+}
+
+// 垂直方向FFT内核：对每列执行逆FFT（通过转置id.yx实现）
+// 线程组尺寸：SIZE×1×1
+[numthreads(SIZE, 1, 1)]
+void CS_VerticalFFT(uint3 id : SV_DISPATCHTHREADID) {
+    // 遍历8个谱通道
+    for (int i = 0; i < 8; ++i) {
+        // 转置id.yx，实现列方向FFT
+        _FourierTarget[uint3(id.yx, i)] = FFT(id.x, _FourierTarget[uint3(id.yx, i)]);
+    }
+}
+
+// 置换函数：修正FFT共轭对称后的相位偏差
+// 原理：基于线程ID的奇偶性取反，抵消FFT的相位偏移
+float4 Permute(float4 data, float3 id) {
+    return data * (1.0f - 2.0f * ((id.x + id.y) % 2));
+}
+
+// 组装贴图内核：将FFT结果转换为位移、斜率、泡沫贴图
+// 线程组尺寸：8x8x1
+[numthreads(8, 8, 1)]
+void CS_AssembleMaps(uint3 id : SV_DISPATCHTHREADID) {
+    // 遍历4个长度尺度
+    for (int i = 0; i < 4; ++i) {
+        // 置换位移谱（修正相位）
+        float4 htildeDisplacement = Permute(_SpectrumTextures[uint3(id.xy, i * 2)], id);
+        // 置换斜率谱（修正相位）
+        float4 htildeSlope = Permute(_SpectrumTextures[uint3(id.xy, i * 2 + 1)], id);
+
+        // 提取位移/斜率分量（实部为有效数据）
+        float2 dxdz = htildeDisplacement.rg;      // x/z位移
+        float2 dydxz = htildeDisplacement.ba;    // y位移
+        float2 dyxdyz = htildeSlope.rg;          // x/z斜率
+        float2 dxxdzz = htildeSlope.ba;          // 二阶导数
+        
+        // 计算雅可比行列式：描述海浪表面的拉伸程度（泡沫生成的核心依据）
+        // 数学公式：J = (1+λx·dxx)(1+λy·dzz) - λxλy·(dydz)²
+        // J<0表示表面拉伸，易产生泡沫
+        float jacobian = (1.0f + _Lambda.x * dxxdzz.x) * (1.0f + _Lambda.y * dxxdzz.y) - _Lambda.x * _Lambda.y * dydxz.y * dydxz.y;
+
+        // 最终位移计算（应用缩放因子）
+        float3 displacement = float3(_Lambda.x * dxdz.x, dydxz.x, _Lambda.y * dxdz.y);
+
+        // 最终斜率计算（归一化，避免过度拉伸）
+        float2 slopes = dyxdyz.xy / (1 + abs(dxxdzz * _Lambda));
+        float covariance = slopes.x * slopes.y; // 斜率协方差（当前未使用）
+
+        // 泡沫计算：
+        float foam = _DisplacementTextures[uint3(id.xy, i)].a; // 读取历史泡沫值
+        foam *= exp(-_FoamDecayRate); // 泡沫指数衰减（模拟自然消失）
+        foam = saturate(foam);        // 限制泡沫值在[0,1]
+
+        // 偏置雅可比行列式：仅保留J < FoamBias的部分（拉伸区域）
+        float biasedJacobian = max(0.0f, -(jacobian - _FoamBias));
+        // 超过阈值时添加泡沫
+        if (biasedJacobian > _FoamThreshold)
+            foam += _FoamAdd * biasedJacobian;
+
+        // 存储位移（xyz）+ 泡沫（a）
+        _DisplacementTextures[uint3(id.xy, i)] = float4(displacement, foam);
+        // 存储斜率（用于法线计算）
+        _SlopeTextures[uint3(id.xy, i)] = float2(slopes);
+
+        // 第一个尺度的垂直位移存入浮力数据贴图
+        if (i == 0) {
+            _BuoyancyData[id.xy] = displacement.y;
+        }
+    }
+}
+
+
+// 高斯滤波核函数：二维高斯分布（预留泡沫平滑用，当前未使用）
+// 数学公式：G(x,y) = 1/√(2πσ²) * exp(-(x²+y²)/(2σ²))
+float gaussian(int x, int y) {
+    float _Spread = 0.5f;          // 高斯核标准差σ
+    float sigmaSqu = _Spread * _Spread; // σ²
+    return (1 / sqrt(2 * PI * sigmaSqu)) * exp(-((x * x) + (y * y)) / (2 * sigmaSqu));
+}
+
+// 采样器：线性过滤 + 重复模式（预留纹理采样用）
+SamplerState linear_repeat_sampler;
+
+// 泡沫累积内核：当前仅清零频谱纹理的第二个通道（预留扩展）
+// 线程组尺寸：8x8x1
+[numthreads(8, 8, 1)]
+void CS_AccumulateFoam(uint3 id : SV_DISPATCHTHREADID) {
+    _SpectrumTextures[uint3(id.xy, 1)] = 0;
+}

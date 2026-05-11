@@ -63,7 +63,7 @@ public class ScreenSpaceReflectionPass_ssr : ScriptableRenderPass
     {
         m_DepthTexture = m_Renderer.cameraDepthTarget;
         m_ColorTexture = m_Renderer.cameraColorTarget;
-        m_NormalTexture = m_Renderer.CameraResolveTarget;
+        //m_NormalTexture = m_Renderer.CameraResolveTarget;  //在源代码里复制cameraDepthTarget的内容改为CameraResolveTarget解决
         m_RenderTarget = m_Renderer.cameraColorTarget;
 
         cmd.GetTemporaryRT(Shader.PropertyToID("_OddBuffer"), renderingData.cameraData.cameraTargetDescriptor,
