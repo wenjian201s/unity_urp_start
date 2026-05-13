@@ -1,0 +1,114 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d500a0f63ee54037a1febba2455fbf20, type: 3}
+  m_Name: FlareAsset
+  m_EditorClassIdentifier: 
+  flareSprite: {fileID: 2800000, guid: 3e5c1addf72b4e44183b2274beecbd11, type: 3}
+  fadeWithScale: 1
+  fadeWithAlpha: 1
+  spriteBlocks:
+  - useLightColor: 0
+    useRotation: 0
+    index: 2
+    block:
+      serializedVersion: 2
+      x: 0.5
+      y: 0.375
+      width: 0.25
+      height: 0.125
+    scale: 0.73
+    offset: 0.56
+    color: {r: 0.41568628, g: 0.41568628, b: 0.38431373, a: 1}
+  - useLightColor: 0
+    useRotation: 0
+    index: 6
+    block:
+      serializedVersion: 2
+      x: 0
+      y: 0
+      width: 0.5
+      height: 0.25
+    scale: 1.71
+    offset: -1.37
+    color: {r: 0.32941177, g: 0.32941177, b: 0.32941177, a: 1}
+  - useLightColor: 0
+    useRotation: 0
+    index: 4
+    block:
+      serializedVersion: 2
+      x: 0.75
+      y: 0.25
+      width: 0.25
+      height: 0.125
+    scale: 2.31
+    offset: -1.04
+    color: {r: 0.49019608, g: 0.49019608, b: 0.49019608, a: 1}
+  - useLightColor: 0
+    useRotation: 0
+    index: 8
+    block:
+      serializedVersion: 2
+      x: 0.5
+      y: 0
+      width: 0.25
+      height: 0.125
+    scale: 1
+    offset: 0.59
+    color: {r: 0.50980395, g: 0.50980395, b: 0.50980395, a: 1}
+  - useLightColor: 0
+    useRotation: 1
+    index: 0
+    block:
+      serializedVersion: 2
+      x: 0
+      y: 0.5
+      width: 1
+      height: 0.5
+    scale: 1.74
+    offset: 1
+    color: {r: 0.39607844, g: 0.39607844, b: 0.39607844, a: 1}
+  - useLightColor: 0
+    useRotation: 0
+    index: 10
+    block:
+      serializedVersion: 2
+      x: 0.75
+      y: 0
+      width: 0.25
+      height: 0.125
+    scale: 2.57
+    offset: -1.15
+    color: {r: 0.39607844, g: 0.39607844, b: 0.39607844, a: 1}
+  - useLightColor: 0
+    useRotation: 0
+    index: 9
+    block:
+      serializedVersion: 2
+      x: 0.75
+      y: 0.125
+      width: 0.25
+      height: 0.125
+    scale: 1.98
+    offset: 0.46
+    color: {r: 0.35686275, g: 0.35686275, b: 0.35686275, a: 1}
+  - useLightColor: 0
+    useRotation: 0
+    index: 4
+    block:
+      serializedVersion: 2
+      x: 0.75
+      y: 0.25
+      width: 0.25
+      height: 0.125
+    scale: 1
+    offset: -0.32
+    color: {r: 0.42745098, g: 0.5058824, b: 0.5372549, a: 1}

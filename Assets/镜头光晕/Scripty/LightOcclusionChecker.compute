@@ -1,0 +1,218 @@
+// 指定 Compute Shader 的入口函数，也叫 kernel。
+// 
+// Unity Compute Shader 中必须用 #pragma kernel 声明哪个函数是计算入口。
+// 这里表示 GPU 会从 PrepareLightOcclusion 这个函数开始执行。
+// 
+// 作用：
+// 用于准备光源遮挡检测需要的深度数据。
+#pragma kernel PrepareLightOcclusion
+
+
+/// <summary>
+/// LightUV 用来保存一个光源采样点在屏幕上的像素坐标。
+/// 
+/// 作用：
+/// x 表示屏幕像素横坐标。
+/// y 表示屏幕像素纵坐标。
+/// 
+/// 原理：
+/// 镜头光晕是否应该显示，通常需要判断光源位置是否被场景物体遮挡。
+/// 所以 CPU 或前一个计算阶段会先把光源的屏幕位置转换成像素坐标，
+/// 然后存入 _LightUV。
+/// 
+/// 注意：
+/// 这里使用的是 int 类型，说明它保存的是像素坐标，
+/// 不是 0~1 范围的归一化 UV。
+/// </summary>
+struct LightUV
+{
+    int x;
+    int y;
+};
+
+
+/// <summary>
+/// RWStructuredBuffer<float> 表示一个 GPU 可读写的结构化缓冲区。
+/// 
+/// _LightSourceDepth 用来保存每个光源采样点对应的线性深度值。
+/// 
+/// 作用：
+/// Compute Shader 会把从深度图中读取到的深度值转换为线性深度，
+/// 然后写入这个 Buffer。
+/// 
+/// RW 的含义：
+/// Read / Write，可读可写。
+/// 
+/// 原理：
+/// GPU 中每个线程处理一个光源采样点：
+/// 
+/// id.x = 第几个采样点
+/// _LightUV[id.x] = 该采样点的屏幕坐标
+/// _LightSourceDepth[id.x] = 该采样点处的线性深度
+/// 
+/// 后续可以用这些深度值判断光源是否被遮挡。
+/// </summary>
+RWStructuredBuffer<float> _LightSourceDepth;
+
+
+/// <summary>
+/// _LightUV 保存所有需要检测的光源屏幕坐标。
+/// 
+/// 作用：
+/// 每一个元素都是一个 LightUV，里面存着一个屏幕像素位置。
+/// 
+/// 原理：
+/// 例如某个光源投影到屏幕坐标为：
+/// x = 512
+/// y = 300
+/// 
+/// 那么 _LightUV 中可能保存：
+/// _LightUV[0].x = 512
+/// _LightUV[0].y = 300
+/// 
+/// Compute Shader 根据这个坐标去 _DepthTex 里取对应像素的深度。
+/// </summary>
+RWStructuredBuffer<LightUV> _LightUV;
+
+
+/// <summary>
+/// _DepthTex 是相机深度纹理。
+/// 
+/// 作用：
+/// 存储屏幕上每个像素对应的深度信息。
+/// 
+/// 原理：
+/// 在 Unity 中，Camera Depth Texture 通常保存的是非线性深度。
+/// 也就是说，它不是简单的世界距离，而是经过投影矩阵变换后的深度值。
+/// 
+/// 所以从 _DepthTex 读取出来的 depth 不能直接当作真实距离使用，
+/// 需要通过 LinearEyeDepth 转换成线性视空间深度。
+/// 
+/// Texture2D<float4>：
+/// 表示这是一张二维纹理，每个像素返回 float4。
+/// 
+/// 实际上深度一般只需要一个通道，
+/// 所以后面代码只使用了 .x 通道。
+/// </summary>
+Texture2D<float4> _DepthTex;
+
+
+/// <summary>
+/// _ZBufferDelivered 是用于深度线性化的参数。
+/// 
+/// 作用：
+/// 把深度纹理中的非线性深度值转换成线性 Eye Depth。
+/// 
+/// 原理：
+/// Unity 内部通常有一个类似的参数叫 _ZBufferParams。
+/// 它根据相机 near plane、far plane、是否使用 Reversed-Z 等信息计算出来。
+/// 
+/// 这里的 _ZBufferDelivered 很可能是 C# 脚本传进 Compute Shader 的自定义版本。
+/// 
+/// LinearEyeDepth 需要使用其中的 z 和 w 分量。
+/// </summary>
+float4 _ZBufferDelivered;
+
+
+/// <summary>
+/// 将深度纹理中的非线性深度转换为线性视空间深度。
+/// 
+/// 参数：
+/// depth：从深度纹理中采样得到的原始深度值。
+/// zBufferParam：用于深度还原的 ZBuffer 参数。
+/// 
+/// 返回值：
+/// 返回线性 Eye Depth，也就是从相机到该像素表面的视空间距离。
+/// 
+/// 原理：
+/// 屏幕深度经过透视投影后不是线性的。
+/// 也就是说，深度图中的 0.5 不代表处在 near 和 far 的正中间。
+/// 
+/// 透视投影会让靠近相机的深度精度更高，远处精度更低。
+/// 因此需要用反投影公式把它还原成线性深度。
+/// 
+/// 公式：
+/// linearDepth = 1.0 / (zBufferParam.z * depth + zBufferParam.w)
+/// 
+/// 在 Unity 中，这个公式和 LinearEyeDepth 的思想一致。
+/// </summary>
+float LinearEyeDepth(float depth, float4 zBufferParam)
+{
+    return 1.0 / (zBufferParam.z * depth + zBufferParam.w);
+}
+
+
+/// <summary>
+/// 指定 Compute Shader 的线程组大小。
+/// 
+/// numthreads(8, 1, 1) 表示：
+/// 每个线程组中有 8 个线程，
+/// X 方向 8 个，Y 方向 1 个，Z 方向 1 个。
+/// 
+/// 作用：
+/// 当前 Kernel 是一维计算任务。
+/// 每个线程负责处理一个光源采样点。
+/// 
+/// 例如：
+/// 如果有 32 个光源采样点，
+/// 那么 C# 侧可以 Dispatch 4 个线程组：
+/// 4 * 8 = 32 个线程。
+/// 
+/// 如果有 10 个采样点，
+/// 通常 Dispatch 2 个线程组：
+/// 2 * 8 = 16 个线程。
+/// 这时多出来的 6 个线程需要用数量判断避免越界。
+/// 当前代码没有做越界保护，所以 C# 侧必须非常小心。
+/// </summary>
+[numthreads(8, 1, 1)]
+
+/// <summary>
+/// PrepareLightOcclusion 是当前 Compute Shader 的主计算函数。
+/// 
+/// 作用：
+/// 根据 _LightUV 中保存的屏幕像素坐标，
+/// 从 _DepthTex 中读取该位置的深度，
+/// 转换为线性深度，
+/// 然后写入 _LightSourceDepth。
+/// 
+/// 参数：
+/// uint3 id : SV_DispatchThreadID
+/// 
+/// SV_DispatchThreadID 是 GPU 自动提供的线程 ID。
+/// 
+/// 因为 numthreads 是一维任务，
+/// 所以这里只使用 id.x。
+/// 
+/// id.x 表示当前线程处理第几个光源采样点。
+/// </summary>
+void PrepareLightOcclusion(uint3 id : SV_DispatchThreadID)
+{
+    // 根据当前线程 id.x，从 _LightUV 中取出一个屏幕像素坐标。
+    //
+    // _LightUV[id.x].x 表示该采样点的屏幕 x 坐标。
+    // _LightUV[id.x].y 表示该采样点的屏幕 y 坐标。
+    //
+    // uint2(...) 把 int 坐标转换成无符号二维整数坐标，
+    // 用于访问 Texture2D 的像素。
+    //
+    // _DepthTex[uint2(x, y)] 使用整数像素坐标直接读取深度纹理。
+    // 注意：
+    // 这不是采样器采样，不会做双线性过滤，
+    // 而是直接读取指定像素。
+    //
+    // .x 表示只取深度纹理的第一个通道。
+    //
+    // LinearEyeDepth(...) 把非线性深度转换成线性视空间深度。
+    //
+    // 最后把结果写入 _LightSourceDepth[id.x]。
+    _LightSourceDepth[id.x] =
+        LinearEyeDepth(
+            _DepthTex[
+                uint2(
+                    _LightUV[id.x].x,
+                    _LightUV[id.x].y
+                )
+            ].x,
+            _ZBufferDelivered
+        );
+}
